@@ -1,17 +1,5 @@
 #!/usr/bin/env python3
-"""YOLO-based preprocessor for 3ds Max renders before Stable Diffusion processing.
-
-The script separates objects into two groups:
-1. preserve: objects where shape/detail should stay sharp.
-2. rewrite: objects that may be heavily redrawn by SD for better aesthetics.
-
-Outputs per image:
-- preserve_mask.png: white mask of "keep sharp" objects
-- rewrite_mask.png: white mask of "can redraw" objects
-- inpaint_mask.png: same as rewrite mask (for SD inpainting)
-- sd_base.png: base image where rewrite zones are softened
-- prompt_hints.txt: detected class summary for prompt engineering
-"""
+"""YOLO-based preprocessor for 3ds Max renders before Stable Diffusion processing."""
 
 from __future__ import annotations
 
@@ -19,7 +7,7 @@ import argparse
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Iterable, List, Set, Tuple
+from typing import Dict, Iterable, List, Optional, Set
 
 import cv2
 import numpy as np
@@ -39,30 +27,41 @@ class ClassPolicy:
     def from_json(path: Path) -> "ClassPolicy":
         with path.open("r", encoding="utf-8") as f:
             raw = json.load(f)
+        return ClassPolicy.from_lists(raw.get("preserve", []), raw.get("rewrite", []))
 
-        preserve = {str(v).strip().lower() for v in raw.get("preserve", []) if str(v).strip()}
-        rewrite = {str(v).strip().lower() for v in raw.get("rewrite", []) if str(v).strip()}
+    @staticmethod
+    def from_lists(preserve: List[str], rewrite: List[str]) -> "ClassPolicy":
+        preserve_set = {str(v).strip().lower() for v in preserve if str(v).strip()}
+        rewrite_set = {str(v).strip().lower() for v in rewrite if str(v).strip()}
 
-        intersection = preserve & rewrite
+        intersection = preserve_set & rewrite_set
         if intersection:
             raise ValueError(
                 f"Один и тот же класс одновременно в preserve и rewrite: {sorted(intersection)}"
             )
 
-        return ClassPolicy(preserve=preserve, rewrite=rewrite)
+        return ClassPolicy(preserve=preserve_set, rewrite=rewrite_set)
 
-    def decide(self, class_name: str) -> str:
+    def decide(self, class_name: str, default_group: str = "rewrite") -> str:
         cname = class_name.lower()
         if cname in self.preserve:
             return "preserve"
         if cname in self.rewrite:
             return "rewrite"
-        return "rewrite"
+        return default_group
+
+
+def parse_class_list(raw: str) -> List[str]:
+    if not raw.strip():
+        return []
+    normalized = raw.replace("\n", ",").replace(";", ",")
+    return [v.strip() for v in normalized.split(",") if v.strip()]
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="YOLO preprocessing for renders before Stable Diffusion.")
+        description="YOLO preprocessing for renders before Stable Diffusion."
+    )
     parser.add_argument("--input", type=Path, required=True, help="Папка с рендерами")
     parser.add_argument("--output", type=Path, required=True, help="Куда сохранять результат")
     parser.add_argument(
@@ -71,12 +70,7 @@ def parse_args() -> argparse.Namespace:
         default="yolov8x-seg.pt",
         help="YOLO Segmentation model path/name (например yolov8x-seg.pt)",
     )
-    parser.add_argument(
-        "--policy",
-        type=Path,
-        required=True,
-        help="JSON файл с классами preserve/rewrite",
-    )
+    parser.add_argument("--policy", type=Path, required=True, help="JSON файл с классами")
     parser.add_argument("--conf", type=float, default=0.25, help="Confidence threshold")
     parser.add_argument("--device", type=str, default="", help="Device, например cpu/cuda:0")
     parser.add_argument(
@@ -89,8 +83,18 @@ def parse_args() -> argparse.Namespace:
         "--min-mask-area",
         type=int,
         default=200,
-        help="Минимальная площадь маски в пикселях, меньше игнорируется",
+        help="Минимальная площадь маски в пикселях",
     )
+    parser.add_argument("--mask-threshold", type=float, default=0.5, help="Порог бинаризации mask")
+    parser.add_argument(
+        "--default-group",
+        type=str,
+        choices=["preserve", "rewrite"],
+        default="rewrite",
+        help="Куда относить классы, которых нет в policy",
+    )
+    parser.add_argument("--dilate", type=int, default=0, help="Дилатация маски (итерации)")
+    parser.add_argument("--erode", type=int, default=0, help="Эрозия маски (итерации)")
     return parser.parse_args()
 
 
@@ -118,26 +122,45 @@ def compose_sd_base(image_bgr: np.ndarray, rewrite_mask: np.ndarray, blur_ksize:
     return out
 
 
-def process_image(
+def apply_morphology(mask: np.ndarray, dilate_iter: int = 0, erode_iter: int = 0) -> np.ndarray:
+    mask_uint8 = mask.astype(np.uint8) * 255
+    kernel = np.ones((3, 3), np.uint8)
+    if dilate_iter > 0:
+        mask_uint8 = cv2.dilate(mask_uint8, kernel, iterations=dilate_iter)
+    if erode_iter > 0:
+        mask_uint8 = cv2.erode(mask_uint8, kernel, iterations=erode_iter)
+    return mask_uint8 > 127
+
+
+def mask_overlay(image_bgr: np.ndarray, preserve_mask: np.ndarray, rewrite_mask: np.ndarray) -> np.ndarray:
+    overlay = image_bgr.copy()
+    green = np.zeros_like(image_bgr)
+    green[:, :, 1] = 255
+    red = np.zeros_like(image_bgr)
+    red[:, :, 2] = 255
+    overlay[preserve_mask] = cv2.addWeighted(overlay[preserve_mask], 0.5, green[preserve_mask], 0.5, 0)
+    overlay[rewrite_mask] = cv2.addWeighted(overlay[rewrite_mask], 0.5, red[rewrite_mask], 0.5, 0)
+    return overlay
+
+
+def process_image_array(
     model: YOLO,
-    image_path: Path,
-    out_dir: Path,
+    image_bgr: np.ndarray,
     policy: ClassPolicy,
     conf: float,
     device: str,
     blur_ksize: int,
     min_mask_area: int,
-) -> None:
-    image = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
-    if image is None:
-        raise RuntimeError(f"Не удалось прочитать {image_path}")
-
-    result = model.predict(source=image, conf=conf, device=device or None, verbose=False)[0]
-    h, w = image.shape[:2]
+    mask_threshold: float = 0.5,
+    default_group: str = "rewrite",
+    dilate_iter: int = 0,
+    erode_iter: int = 0,
+) -> Dict[str, object]:
+    result = model.predict(source=image_bgr, conf=conf, device=device or None, verbose=False)[0]
+    h, w = image_bgr.shape[:2]
 
     preserve_mask = np.zeros((h, w), dtype=bool)
     rewrite_mask = np.zeros((h, w), dtype=bool)
-
     class_counter: Dict[str, int] = {}
 
     if result.masks is not None and result.boxes is not None:
@@ -148,56 +171,97 @@ def process_image(
         for cls_id, mask_arr in zip(cls_ids, masks):
             class_name = str(names[int(cls_id)])
             class_counter[class_name] = class_counter.get(class_name, 0) + 1
-
-            mask = mask_arr > 0.5
+            mask = mask_arr > mask_threshold
             if int(mask.sum()) < min_mask_area:
                 continue
 
-            decision = policy.decide(class_name)
+            decision = policy.decide(class_name, default_group=default_group)
             if decision == "preserve":
                 preserve_mask |= mask
             else:
                 rewrite_mask |= mask
 
-    # safety: preserve has priority in overlaps
     rewrite_mask &= ~preserve_mask
 
-    stem = image_path.stem
-    img_out_dir = out_dir / stem
+    preserve_mask = apply_morphology(preserve_mask, dilate_iter=dilate_iter, erode_iter=erode_iter)
+    rewrite_mask = apply_morphology(rewrite_mask, dilate_iter=dilate_iter, erode_iter=erode_iter)
+    rewrite_mask &= ~preserve_mask
+
+    sd_base = compose_sd_base(image_bgr, rewrite_mask, blur_ksize)
+    overlay = mask_overlay(image_bgr, preserve_mask, rewrite_mask)
+
+    return {
+        "preserve_mask": preserve_mask,
+        "rewrite_mask": rewrite_mask,
+        "inpaint_mask": rewrite_mask.copy(),
+        "sd_base": sd_base,
+        "overlay": overlay,
+        "classes": class_counter,
+    }
+
+
+def write_outputs(output_dir: Path, stem: str, processed: Dict[str, object]) -> Path:
+    img_out_dir = output_dir / stem
     img_out_dir.mkdir(parents=True, exist_ok=True)
 
-    preserve_mask_path = img_out_dir / "preserve_mask.png"
-    rewrite_mask_path = img_out_dir / "rewrite_mask.png"
-    inpaint_mask_path = img_out_dir / "inpaint_mask.png"
-    sd_base_path = img_out_dir / "sd_base.png"
-    prompt_hints_path = img_out_dir / "prompt_hints.txt"
+    save_mask(processed["preserve_mask"], img_out_dir / "preserve_mask.png")
+    save_mask(processed["rewrite_mask"], img_out_dir / "rewrite_mask.png")
+    save_mask(processed["inpaint_mask"], img_out_dir / "inpaint_mask.png")
+    cv2.imwrite(str(img_out_dir / "sd_base.png"), processed["sd_base"])
+    cv2.imwrite(str(img_out_dir / "overlay.png"), processed["overlay"])
 
-    save_mask(preserve_mask, preserve_mask_path)
-    save_mask(rewrite_mask, rewrite_mask_path)
-    save_mask(rewrite_mask, inpaint_mask_path)
-
-    sd_base = compose_sd_base(image, rewrite_mask, blur_ksize)
-    cv2.imwrite(str(sd_base_path), sd_base)
-
-    with prompt_hints_path.open("w", encoding="utf-8") as f:
-        if not class_counter:
+    with (img_out_dir / "prompt_hints.txt").open("w", encoding="utf-8") as f:
+        classes = processed["classes"]
+        if not classes:
             f.write("No objects detected by YOLO.\n")
             f.write("Tip: lower --conf or use a more suitable segmentation model.\n")
         else:
             f.write("Detected objects:\n")
-            for name, count in sorted(class_counter.items(), key=lambda x: (-x[1], x[0])):
-                label = policy.decide(name)
-                f.write(f"- {name}: {count} ({label})\n")
+            for name, count in sorted(classes.items(), key=lambda x: (-x[1], x[0])):
+                f.write(f"- {name}: {count}\n")
+    return img_out_dir
+
+
+def process_image_file(
+    model: YOLO,
+    image_path: Path,
+    out_dir: Path,
+    policy: ClassPolicy,
+    conf: float,
+    device: str,
+    blur_ksize: int,
+    min_mask_area: int,
+    mask_threshold: float,
+    default_group: str,
+    dilate_iter: int,
+    erode_iter: int,
+) -> None:
+    image = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
+    if image is None:
+        raise RuntimeError(f"Не удалось прочитать {image_path}")
+
+    processed = process_image_array(
+        model=model,
+        image_bgr=image,
+        policy=policy,
+        conf=conf,
+        device=device,
+        blur_ksize=blur_ksize,
+        min_mask_area=min_mask_area,
+        mask_threshold=mask_threshold,
+        default_group=default_group,
+        dilate_iter=dilate_iter,
+        erode_iter=erode_iter,
+    )
+    write_outputs(out_dir, image_path.stem, processed)
 
 
 def main() -> None:
     args = parse_args()
-
     if not args.input.exists() or not args.input.is_dir():
         raise FileNotFoundError(f"Папка input не найдена: {args.input}")
 
     args.output.mkdir(parents=True, exist_ok=True)
-
     policy = ClassPolicy.from_json(args.policy)
     model = YOLO(args.model)
 
@@ -206,7 +270,7 @@ def main() -> None:
         raise RuntimeError(f"В папке {args.input} нет изображений")
 
     for image_path in images:
-        process_image(
+        process_image_file(
             model=model,
             image_path=image_path,
             out_dir=args.output,
@@ -215,6 +279,10 @@ def main() -> None:
             device=args.device,
             blur_ksize=args.rewrite_blur,
             min_mask_area=args.min_mask_area,
+            mask_threshold=args.mask_threshold,
+            default_group=args.default_group,
+            dilate_iter=args.dilate,
+            erode_iter=args.erode,
         )
         print(f"[OK] {image_path.name}")
 
