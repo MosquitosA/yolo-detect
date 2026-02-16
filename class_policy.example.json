@@ -1,0 +1,19 @@
+{
+  "preserve": [
+    "car",
+    "truck",
+    "bus",
+    "motorcycle",
+    "bicycle",
+    "person",
+    "chair",
+    "couch",
+    "tv",
+    "laptop"
+  ],
+  "rewrite": [
+    "sky",
+    "potted plant",
+    "dining table"
+  ]
+}
