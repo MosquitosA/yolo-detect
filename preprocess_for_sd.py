@@ -7,7 +7,7 @@ import argparse
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Set
+from typing import Dict, Iterable, List, Set
 
 import cv2
 import numpy as np
@@ -143,6 +143,21 @@ def mask_overlay(image_bgr: np.ndarray, preserve_mask: np.ndarray, rewrite_mask:
     return overlay
 
 
+def to_image_mask(mask_arr: np.ndarray, image_shape: tuple[int, int]) -> np.ndarray:
+    """Convert a model mask to the same size as source image.
+
+    Some YOLO segmentation models can return mask tensors in network resolution
+    (e.g. 640x640/512x640) instead of original image shape. We explicitly resize
+    with nearest interpolation to keep masks binary-compatible.
+    """
+    target_h, target_w = image_shape
+    if mask_arr.shape[:2] == (target_h, target_w):
+        return mask_arr
+
+    resized = cv2.resize(mask_arr.astype(np.float32), (target_w, target_h), interpolation=cv2.INTER_NEAREST)
+    return resized
+
+
 def process_image_array(
     model: YOLO,
     image_bgr: np.ndarray,
@@ -171,7 +186,8 @@ def process_image_array(
         for cls_id, mask_arr in zip(cls_ids, masks):
             class_name = str(names[int(cls_id)])
             class_counter[class_name] = class_counter.get(class_name, 0) + 1
-            mask = mask_arr > mask_threshold
+            mask_resized = to_image_mask(mask_arr, (h, w))
+            mask = mask_resized > mask_threshold
             if int(mask.sum()) < min_mask_area:
                 continue
 
